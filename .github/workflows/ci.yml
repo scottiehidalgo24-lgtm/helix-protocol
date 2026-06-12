@@ -46,12 +46,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
       - name: Verify Bridge Dockerfile
         run: test -f docker/bridge/Dockerfile && echo "✅ Dockerfile exists"
       - name: Build Docker image
