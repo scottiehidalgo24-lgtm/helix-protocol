@@ -1,0 +1,22 @@
+{
+  "name": "helix-protocol",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Infrastruttura per l'economia autonoma degli agenti AI",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint",
+    "test": "turbo test",
+    "format": "prettier --write .",
+    "docker:bridge": "docker build -t helix-bridge -f docker/bridge/Dockerfile ."
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0",
+    "prettier": "^3.3.0",
+    "typescript": "^5.5.0"
+  }
+}

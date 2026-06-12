@@ -1,0 +1,23 @@
+{
+  "name": "@helix/bridge",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "build": "tsc",
+    "start": "bun src/index.ts",
+    "lint": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "hono": "^4.0.0",
+    "@hono/zod-validator": "^0.2.0",
+    "zod": "^3.23.0",
+    "@helix/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  }
+}
