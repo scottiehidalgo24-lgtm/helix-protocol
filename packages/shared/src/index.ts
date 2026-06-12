@@ -1,14 +1,13 @@
-// Tipi condivisi per Helix Protocol
-
 export interface BridgeTool {
   id: string;
   name: string;
   description: string;
   provider: string;
   endpoint: string;
+  method?: string;
   authType: 'api_key' | 'oauth2' | 'none';
   inputSchema: Record<string, unknown>;
-  outputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
   pricing?: {
     type: 'free' | 'per_call' | 'subscription';
     cost?: number;
