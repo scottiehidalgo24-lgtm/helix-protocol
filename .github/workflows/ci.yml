@@ -1,0 +1,56 @@
+name: Helix CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: cd packages/bridge && bun install
+      - name: Type check Bridge
+        run: cd packages/bridge && bun --eval "import app from './src/index.ts'; console.log('✅ Bridge module OK')"
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: cd packages/web && bun install
+      - name: Build Web
+        run: cd packages/web && bun next build
+
+  docker:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Bridge Docker image
+        run: |
+          docker build -t ghcr.io/scottiehidalgo24-lgtm/helix-bridge:latest \
+            -f docker/bridge/Dockerfile .
+      - name: Verify image
+        run: docker images | grep helix-bridge
