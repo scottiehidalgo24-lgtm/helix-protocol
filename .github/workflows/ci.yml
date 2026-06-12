@@ -42,16 +42,21 @@ jobs:
         run: cd packages/web && bun next build
 
   docker:
-    name: Docker Build & Push
+    name: Docker Build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
-      - name: Build Bridge Docker image
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Verify Bridge Dockerfile
+        run: test -f docker/bridge/Dockerfile && echo "✅ Dockerfile exists"
+      - name: Build Docker image
         run: |
-          docker build -t ghcr.io/scottiehidalgo24-lgtm/helix-bridge:latest \
+          docker build -t helix-bridge:latest \
             -f docker/bridge/Dockerfile .
       - name: Verify image
         run: docker images | grep helix-bridge
