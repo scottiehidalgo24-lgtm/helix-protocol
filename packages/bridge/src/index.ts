@@ -1,284 +1,304 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { z } from 'zod';
-import { zValidator } from '@hono/zod-validator';
+import { z, ZodError } from 'zod';
 import type { BridgeTool, BridgeCallResponse } from '@helix/shared';
 import { translateOpenAPI } from './translate';
 import { proxyCall } from './proxy';
-import {
-  authenticate,
-  registerApiKey,
-  generateApiKey,
-  generateOAuthCredentials,
-  registerOAuthToken,
-} from './auth';
+import { authenticate, registerApiKey, generateApiKey, generateOAuthCredentials, registerOAuthToken } from './auth';
 import { logCall } from './db';
 
 const app = new Hono();
 
-// CORS per dashboard frontend
+// ============================================
+// HELPERS
+// ============================================
+
+function getAuthHeader(c: any): string | undefined {
+  const auth = c.req.header('authorization');
+  if (auth) return auth;
+  for (const key of ['x-api-key', 'x-helix-api-key', 'helix-api-key']) {
+    const val = c.req.header(key);
+    if (val) return val;
+  }
+  return undefined;
+}
+
+function reqId(): string {
+  return `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function jsonErr(code: string, msg: string, status: number, detail?: string) {
+  return { error: { code, message: msg, details: detail || undefined, request_id: reqId() } };
+}
+
+function zodErr(e: ZodError) {
+  const issues = e.issues.map(i => ({ path: i.path.join('.'), message: i.message, code: i.code }));
+  return {
+    error: {
+      code: 'VALIDATION_ERROR',
+      message: 'Request validation failed',
+      details: `Missing or invalid: ${issues.map(i => i.path || i.message).join(', ')}`,
+      validation_errors: issues,
+      request_id: reqId(),
+    }
+  };
+}
+
+function truncate(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+
+// Custom validation middleware
+function validate<T>(schema: z.ZodSchema<T>) {
+  return async (c: any, next: any) => {
+    let body: unknown;
+    try { body = await c.req.json(); } catch {
+      return c.json(jsonErr('VALIDATION_ERROR', 'Invalid JSON body', 400), 400);
+    }
+    const result = schema.safeParse(body);
+    if (!result.success) {
+      return c.json(zodErr(result.error), 400);
+    }
+    c.set('body', result.data);
+    return next();
+  };
+}
+
+// Auth middleware
+function requireAuth(c: any, next: any) {
+  const h = getAuthHeader(c);
+  if (!h) return c.json(jsonErr('AUTH_MISSING', 'Missing authorization. Use Authorization: Bearer <token> or X-API-Key: <key>', 401), 401);
+  const r = authenticate(h);
+  if (!r.authenticated) return c.json(jsonErr('AUTH_INVALID', r.error || 'Invalid credentials', 401), 401);
+  c.set('agentId', r.agentId);
+  c.set('authType', r.authType);
+  return next();
+}
+
+// ============================================
+// TOOL STORE with Multi-Tenancy
+// ============================================
+const tools: Map<string, BridgeTool & { ownerId: string }> = new Map();
+
+function getTenantTools(agentId: string) {
+  return Array.from(tools.values()).filter(t => t.ownerId === agentId);
+}
+
+function getOwnedTool(id: string, agentId: string) {
+  const t = tools.get(id);
+  if (!t || t.ownerId !== agentId) return null;
+  return t;
+}
+
+// ============================================
+// CORS + ROOT
+// ============================================
 app.use('*', cors());
 
-// ============================================
-// MIDDLEWARE: Autenticazione Bridge
-// ============================================
-app.use('/tools/register', async (c, next) => {
-  const authHeader = c.req.header('authorization') || c.req.header('x-helix-api-key');
-  const result = authenticate(authHeader);
-  if (!result.authenticated) {
-    return c.json({ error: result.error }, 401);
-  }
-  c.set('agentId', result.agentId);
-  c.set('authType', result.authType);
-  await next();
-});
+app.get('/', (c) => c.json({
+  service: 'Helix Protocol Bridge',
+  version: '0.2.0',
+  docs: 'https://github.com/scottiehidalgo24-lgtm/helix-protocol',
+  multi_tenancy: 'Each tenant sees only their own tools. Tools are isolated by agentId.',
+  auth_methods: {
+    recommended: 'Authorization: Bearer <apiKey> (works everywhere)',
+    alternative: 'Authorization: Bearer <access_token>',
+    localhost_only: 'X-API-Key: <apiKey> (filtered by Cloudflare proxy)',
+  },
+  endpoints: {
+    health: 'GET /health',
+    register: 'POST /auth/register (public — onboarding)',
+    tools: 'GET /tools (auth — tenant-scoped)',
+    create_tool: 'POST /tools (auth)',
+    get_tool: 'GET /tools/:id (auth — ownership required)',
+    delete_tool: 'DELETE /tools/:id (auth — ownership required)',
+    call: 'POST /call/:toolId (auth — ownership required)',
+    translate: 'POST /translate (auth — auto-registers for your tenant)',
+    oauth_token: 'POST /auth/oauth2/token (public)',
+  },
+  auth: 'X-API-Key: <key> or Authorization: Bearer <token>',
+  error_model: '{ error: { code, message, details?, validation_errors?, request_id } }',
+}));
 
 // ============================================
-// HEALTH CHECK
+// HEALTH
 // ============================================
-app.get('/health', (c) => {
-  return c.json({
-    status: 'ok',
-    service: 'bridge',
-    version: '0.1.0',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-  });
-});
+app.get('/health', (c) => c.json({
+  status: 'ok', service: 'bridge', version: '0.2.0',
+  uptime: process.uptime(), timestamp: new Date().toISOString(),
+}));
 
 // ============================================
-// TOOL REGISTRY
+// TOOL CRUD — multi-tenant
 // ============================================
-// In-memory tool registry (MVP — sarà in Supabase)
-const toolRegistry: Map<string, BridgeTool> = new Map();
-
-const registerSchema = z.object({
-  name: z.string().min(1).max(255),
-  description: z.string().min(1),
-  provider: z.string().min(1),
-  endpoint: z.string(),
+const regSchema = z.object({
+  name: z.string().min(1, 'name is required').max(255),
+  description: z.string().min(1, 'description is required'),
+  provider: z.string().min(1, 'provider is required'),
+  endpoint: z.string().min(1, 'endpoint is required'),
   method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']).default('GET'),
   authType: z.enum(['api_key', 'oauth2', 'none']),
   inputSchema: z.record(z.unknown()),
   outputSchema: z.record(z.unknown()).optional(),
   pricing: z.object({
     type: z.enum(['free', 'per_call', 'subscription']),
-    cost: z.number().optional(),
-    currency: z.string().optional(),
+    cost: z.number().optional(), currency: z.string().optional(),
   }).optional(),
 });
 
-// Registra un nuovo tool
-app.post('/tools/register', zValidator('json', registerSchema), async (c) => {
-  const body = c.req.valid('json');
+app.post('/tools', requireAuth, validate(regSchema), (c) => {
+  const body: any = c.get('body');
+  const ownerId = c.get('agentId');
   const id = `tool_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
-  const tool: BridgeTool = { id, ...body };
-  toolRegistry.set(id, tool);
-
-  console.log(`[Bridge] Tool registered: ${tool.name} (${id}) by agent ${c.get('agentId')}`);
-
-  return c.json({ success: true, tool }, 201);
+  const t = { id, ownerId, ...body };
+  tools.set(id, t);
+  console.log(`[Bridge] Tool registered: ${t.name} (${id}) by ${ownerId}`);
+  return c.json({ success: true, tool: t }, 201);
 });
 
-// Lista tutti i tool
-app.get('/tools', (c) => {
-  const tools = Array.from(toolRegistry.values()).map(t => ({
-    id: t.id,
-    name: t.name,
-    description: t.description,
-    provider: t.provider,
-    authType: t.authType,
-    pricing: t.pricing,
+app.post('/tools/register', requireAuth, validate(regSchema), (c) => {
+  const body: any = c.get('body');
+  const ownerId = c.get('agentId');
+  const id = `tool_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+  const t = { id, ownerId, ...body };
+  tools.set(id, t);
+  console.log(`[Bridge] Tool registered: ${t.name} (${id}) by ${ownerId}`);
+  return c.json({ success: true, tool: t }, 201);
+});
+
+// GET /tools — tenant-scoped
+app.get('/tools', requireAuth, (c) => {
+  const agentId = c.get('agentId');
+  const arr = getTenantTools(agentId).map(t => ({
+    id: t.id, name: t.name, description: t.description,
+    provider: t.provider, authType: t.authType, pricing: t.pricing,
   }));
-  return c.json({ tools, count: tools.length });
+  return c.json({ tools: arr, count: arr.length, tenant: agentId });
 });
 
-// Dettaglio singolo tool
-app.get('/tools/:id', (c) => {
-  const id = c.req.param('id');
-  const tool = toolRegistry.get(id);
-  if (!tool) return c.json({ error: 'Tool not found' }, 404);
-  return c.json({ tool });
+// GET /tools/:id — ownership check
+app.get('/tools/:id', requireAuth, (c) => {
+  const t = getOwnedTool(c.req.param('id'), c.get('agentId'));
+  return t ? c.json({ tool: t }) : c.json(jsonErr('TOOL_NOT_FOUND', 'Tool not found', 404), 404);
 });
 
-// Cancella un tool
-app.delete('/tools/:id', async (c, next) => {
-  const authHeader = c.req.header('authorization') || c.req.header('x-helix-api-key');
-  const result = authenticate(authHeader);
-  if (!result.authenticated) {
-    return c.json({ error: result.error }, 401);
-  }
-  await next();
-}, (c) => {
-  const id = c.req.param('id');
-  const existed = toolRegistry.delete(id);
-  if (!existed) return c.json({ error: 'Tool not found' }, 404);
+// DELETE /tools/:id — ownership check
+app.delete('/tools/:id', requireAuth, (c) => {
+  const tid = c.req.param('id');
+  const t = getOwnedTool(tid, c.get('agentId'));
+  if (!t) return c.json(jsonErr('TOOL_NOT_FOUND', 'Tool not found', 404), 404);
+  tools.delete(tid);
+  console.log(`[Bridge] Tool deleted: ${t.name} (${tid}) by ${c.get('agentId')}`);
   return c.json({ success: true });
 });
 
 // ============================================
-// ENDPOINT CALL (PROXY)
+// CALL — ownership check + upstream status forwarding
 // ============================================
 const callSchema = z.object({
   params: z.record(z.unknown()).default({}),
-  auth: z.object({
-    apiKey: z.string().optional(),
-    oauthToken: z.string().optional(),
-  }).optional(),
+  auth: z.object({ apiKey: z.string().optional(), oauthToken: z.string().optional() }).optional(),
 });
 
-app.post('/call/:toolId', zValidator('json', callSchema), async (c) => {
-  const toolId = c.req.param('toolId');
-  const body = c.req.valid('json');
-  const tool = toolRegistry.get(toolId);
-
-  if (!tool) {
-    return c.json({
-      success: false,
-      error: 'Tool not found',
-      latencyMs: 0,
-      timestamp: new Date().toISOString(),
-    } as BridgeCallResponse, 404);
+app.post('/call/:toolId', requireAuth, validate(callSchema), async (c) => {
+  const tid = c.req.param('toolId');
+  const t = getOwnedTool(tid, c.get('agentId'));
+  if (!t) {
+    return c.json({ success: false, error: 'Tool not found', latencyMs: 0, timestamp: new Date().toISOString() }, 404);
   }
-
-  const agentId = c.get('agentId') || 'anonymous';
+  const body: any = c.get('body');
+  const aid = c.get('agentId');
   const ip = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
-
-  const result = await proxyCall(tool, body.params, body.auth);
-
-  // Log asincrono
+  const result = await proxyCall(t, body.params, body.auth);
   logCall({
-    tool_id: toolId,
-    agent_id: agentId,
-    request_params: body.params,
+    tool_id: tid, agent_id: aid, request_params: body.params,
     response_data: result.data as Record<string, unknown> | undefined,
     status: result.success ? 'success' : 'error',
-    latency_ms: result.latencyMs,
-    error_message: result.error,
-    ip_address: ip,
-  }).catch(err => console.error('[Bridge] Log error:', err));
-
-  return c.json(result);
+    latency_ms: result.latencyMs, error_message: result.error, ip_address: ip,
+  }).catch(e => console.error('[Bridge] Log error:', e));
+  // Passthrough upstream status (transparent proxy semantics)
+  const upstreamStatus = result.success ? 200 : (result.status && result.status >= 400 ? result.status : 502);
+  if (!result.success) {
+    const dataStr = typeof result.data === 'string' ? result.data : JSON.stringify(result.data);
+    return c.json(jsonErr('UPSTREAM_ERROR', result.error || 'Upstream error', upstreamStatus, truncate(dataStr, 200)), upstreamStatus as any);
+  }
+  return c.json({
+    ...result,
+    upstream_status: upstreamStatus,
+  }, 200);
 });
 
 // ============================================
-// OPENAPI TRANSLATION
+// TRANSLATE — auto-register for current tenant
 // ============================================
-const translateSchema = z.object({
-  spec: z.unknown(),
-  providerName: z.string().optional(),
-});
+const trSchema = z.object({ spec: z.unknown(), providerName: z.string().optional() });
 
-app.post('/translate', zValidator('json', translateSchema), async (c) => {
-  const { spec, providerName } = c.req.valid('json');
+app.post('/translate', requireAuth, validate(trSchema), (c) => {
+  const { spec, providerName }: any = c.get('body');
+  const ownerId = c.get('agentId');
   const result = translateOpenAPI(spec, providerName);
-
   if (result.success && result.tools.length > 0) {
-    // Auto-registra i tool tradotti
-    const registeredTools: BridgeTool[] = [];
+    const reg: Array<{ id: string; name: string }> = [];
     for (const t of result.tools) {
-      const id = `tool_translated_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-      const tool: BridgeTool = {
-        id,
-        name: t.name,
-        description: t.description,
-        provider: result.provider,
-        endpoint: t.path,
-        authType: t.authType,
-        inputSchema: t.inputSchema,
-        outputSchema: t.outputSchema,
-      };
-      toolRegistry.set(id, tool);
-      registeredTools.push(tool);
+      const id = `tool_tr_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+      tools.set(id, { id, ownerId, name: t.name, description: t.description, provider: result.provider, endpoint: t.path, authType: t.authType, inputSchema: t.inputSchema, outputSchema: t.outputSchema, method: t.method });
+      reg.push({ id, name: t.name });
     }
-    return c.json({
-      ...result,
-      registered: registeredTools.map(t => ({ id: t.id, name: t.name })),
-    });
+    return c.json({ ...result, registered: reg });
   }
-
   return c.json(result);
 });
 
 // ============================================
-// AUTH MANAGEMENT
+// AUTH
 // ============================================
-
-// Genera API key (richiede autenticazione admin)
-app.post('/auth/api-key', async (c) => {
-  const authHeader = c.req.header('authorization');
-  const result = authenticate(authHeader);
-  if (!result.authenticated) {
-    return c.json({ error: result.error }, 401);
-  }
-
+app.post('/auth/register', async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const agentId = body.agentId || result.agentId;
-  const scopes = body.scopes || ['*'];
-
+  const agentId = body.agentId || `agent_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const scopes = body.scopes || ['read', 'write'];
   const apiKey = generateApiKey();
   registerApiKey(apiKey, agentId, scopes);
-
-  return c.json({
-    success: true,
-    apiKey,
-    agentId,
-    scopes,
-    message: 'Store this key securely. It will not be shown again.',
-  }, 201);
+  const token = `helix_at_${Array.from({ length: 48 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('')}`;
+  registerOAuthToken(token, agentId, 3600);
+  console.log(`[Bridge] New registration: ${agentId}`);
+  return c.json({ success: true, apiKey, access_token: token, token_type: 'Bearer', expires_in: 3600, agentId, scopes }, 201);
 });
 
-// Client credentials OAuth2
-app.post('/auth/oauth2/register', async (c) => {
-  const authHeader = c.req.header('authorization');
-  const result = authenticate(authHeader);
-  if (!result.authenticated) {
-    return c.json({ error: result.error }, 401);
-  }
+app.post('/auth/api-key', requireAuth, async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const agentId = body.agentId || c.get('agentId');
+  const apiKey = generateApiKey();
+  registerApiKey(apiKey, agentId, body.scopes || ['*']);
+  return c.json({ success: true, apiKey, agentId }, 201);
+});
 
+app.post('/auth/oauth2/register', requireAuth, async (c) => {
   const { clientId, clientSecret } = generateOAuthCredentials();
-
-  return c.json({
-    success: true,
-    clientId,
-    clientSecret,
-    message: 'Store these credentials securely.',
-  }, 201);
+  return c.json({ success: true, clientId, clientSecret }, 201);
 });
 
-// OAuth2 token exchange
 app.post('/auth/oauth2/token', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const { client_id, client_secret, grant_type } = body as Record<string, string>;
-
-  if (grant_type !== 'client_credentials') {
-    return c.json({ error: 'Unsupported grant type' }, 400);
-  }
-
-  // In MVP: validazione base. In produzione: controllo reale client credentials
-  if (!client_id || !client_secret) {
-    return c.json({ error: 'Missing client_id or client_secret' }, 400);
-  }
-
-  const token = `helix_at_${Array.from({ length: 48 }, () =>
-    'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]
-  ).join('')}`;
-
+  if (grant_type !== 'client_credentials') return c.json(jsonErr('AUTH_UNSUPPORTED_GRANT', 'Unsupported grant type', 400), 400);
+  if (!client_id || !client_secret) return c.json(jsonErr('AUTH_MISSING_PARAMS', 'Missing client_id or client_secret', 400), 400);
+  const token = `helix_at_${Array.from({ length: 48 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('')}`;
   registerOAuthToken(token, client_id, 3600);
-
-  return c.json({
-    access_token: token,
-    token_type: 'Bearer',
-    expires_in: 3600,
-  });
+  return c.json({ access_token: token, token_type: 'Bearer', expires_in: 3600 });
 });
 
 // ============================================
-// METRICS
+// METRICS — tenant-aware
 // ============================================
 app.get('/metrics', (c) => {
+  const ip = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'direct';
+  if (!ip.startsWith('127.') && ip !== '::1' && ip !== 'direct')
+    return c.json(jsonErr('METRICS_INTERNAL', 'Metrics are internal only', 403), 403);
+  const allTools = Array.from(tools.values());
+  const tenants = new Set(allTools.map(t => t.ownerId));
   return c.json({
-    tools: toolRegistry.size,
+    tools: allTools.length,
+    tenants: tenants.size,
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     timestamp: new Date().toISOString(),
@@ -287,6 +307,5 @@ app.get('/metrics', (c) => {
 
 export default app;
 
-// Start server
 const port = parseInt(process.env.PORT || '3000');
-console.log(`🧬 Helix Bridge v0.1.0 running on port ${port}`);
+console.log('🧬 Helix Bridge v0.2.0 running on port', port);
