@@ -97,34 +97,39 @@ app.use('*', cors());
 
 app.get('/', (c) => c.json({
   service: 'Helix Protocol Bridge',
-  version: '0.2.0',
+  version: '0.2.2',
   docs: 'https://github.com/scottiehidalgo24-lgtm/helix-protocol',
   multi_tenancy: 'Each tenant sees only their own tools. Tools are isolated by agentId.',
-  auth_methods: {
-    recommended: 'Authorization: Bearer <apiKey> (works everywhere)',
-    alternative: 'Authorization: Bearer <access_token>',
-    localhost_only: 'X-API-Key: <apiKey> (filtered by Cloudflare proxy)',
+  auth: {
+    methods: ['Authorization: Bearer <apiKey>', 'Authorization: Bearer <access_token>'],
+    api_key: 'Long-lived secret (hk_*). No expiry. For server-to-server integrations.',
+    access_token: 'Short-lived OAuth2 token (expires_in: 3600). Obtain via POST /auth/register. For client apps.',
+    note: 'X-API-Key passes through Cloudflare in most cases but Authorization: Bearer is recommended for guaranteed cross-environment compatibility (works on localhost, VPS, and Cloudflare).',
+  },
+  proxy: {
+    semantics: 'Transparent passthrough — upstream HTTP status forwarded to client as-is (no remapping to 502/504).',
+    upstream_status: 'Present in both success and error responses as upstream_status field.',
   },
   endpoints: {
     health: 'GET /health',
     register: 'POST /auth/register (public — onboarding)',
-    tools: 'GET /tools (auth — tenant-scoped)',
+    tools: 'GET /tools?limit=&offset= (auth — tenant-scoped, paginated)',
     create_tool: 'POST /tools (auth)',
     get_tool: 'GET /tools/:id (auth — ownership required)',
     delete_tool: 'DELETE /tools/:id (auth — ownership required)',
     call: 'POST /call/:toolId (auth — ownership required)',
+    token_info: 'GET /auth/me (auth — token introspection)',
     translate: 'POST /translate (auth — auto-registers for your tenant)',
     oauth_token: 'POST /auth/oauth2/token (public)',
   },
-  auth: 'X-API-Key: <key> or Authorization: Bearer <token>',
-  error_model: '{ error: { code, message, details?, validation_errors?, request_id } }',
+  error_model: '{ error: { code, message, details?, validation_errors?, upstream_status?, upstream_url?, request_id } }',
 }));
 
 // ============================================
 // HEALTH
 // ============================================
 app.get('/health', (c) => c.json({
-  status: 'ok', service: 'bridge', version: '0.2.0',
+  status: 'ok', service: 'bridge', version: '0.2.2',
   uptime: process.uptime(), timestamp: new Date().toISOString(),
 }));
 
@@ -166,14 +171,24 @@ app.post('/tools/register', requireAuth, validate(regSchema), (c) => {
   return c.json({ success: true, tool: t }, 201);
 });
 
-// GET /tools — tenant-scoped
+// GET /tools — tenant-scoped, paginated
 app.get('/tools', requireAuth, (c) => {
   const agentId = c.get('agentId');
-  const arr = getTenantTools(agentId).map(t => ({
+  const all = getTenantTools(agentId).map(t => ({
     id: t.id, name: t.name, description: t.description,
     provider: t.provider, authType: t.authType, pricing: t.pricing,
   }));
-  return c.json({ tools: arr, count: arr.length, tenant: agentId });
+  const limit = parseInt(c.req.query('limit') || '0') || 0;
+  const offset = parseInt(c.req.query('offset') || '0') || 0;
+  const page = limit > 0 ? all.slice(offset, offset + limit) : (offset > 0 ? all.slice(offset) : all);
+  return c.json({
+    tools: page,
+    count: page.length,
+    total: all.length,
+    limit: limit || undefined,
+    offset: offset || undefined,
+    tenant: agentId,
+  });
 });
 
 // GET /tools/:id — ownership check
@@ -216,11 +231,19 @@ app.post('/call/:toolId', requireAuth, validate(callSchema), async (c) => {
     status: result.success ? 'success' : 'error',
     latency_ms: result.latencyMs, error_message: result.error, ip_address: ip,
   }).catch(e => console.error('[Bridge] Log error:', e));
-  // Passthrough upstream status (transparent proxy semantics)
+  // Transparent passthrough: upstream HTTP status forwarded as-is (no remapping to 502/504).
+  // upstream_status field included in both success and error responses.
   const upstreamStatus = result.success ? 200 : (result.status && result.status >= 400 ? result.status : 502);
   if (!result.success) {
     const dataStr = typeof result.data === 'string' ? result.data : JSON.stringify(result.data);
-    return c.json(jsonErr('UPSTREAM_ERROR', result.error || 'Upstream error', upstreamStatus, truncate(dataStr, 200)), upstreamStatus as any);
+    const baseErr = jsonErr('UPSTREAM_ERROR', result.error || 'Upstream error', upstreamStatus, truncate(dataStr, 200));
+    return c.json({
+      error: {
+        ...baseErr.error,
+        upstream_status: upstreamStatus,
+        upstream_url: t.endpoint,
+      }
+    }, upstreamStatus as any);
   }
   return c.json({
     ...result,
@@ -252,6 +275,19 @@ app.post('/translate', requireAuth, validate(trSchema), (c) => {
 // ============================================
 // AUTH
 // ============================================
+// GET /auth/me — token introspection
+app.get('/auth/me', requireAuth, (c) => {
+  const h = getAuthHeader(c);
+  if (!h) return c.json(jsonErr('AUTH_MISSING', 'Missing authorization', 401), 401);
+  const r = authenticate(h);
+  if (!r.authenticated) return c.json(jsonErr('AUTH_INVALID', r.error || 'Invalid token', 401), 401);
+  return c.json({
+    agentId: r.agentId,
+    auth_type: r.authType,
+    scopes: r.scopes || [],
+    authenticated: true,
+  });
+});
 app.post('/auth/register', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const agentId = body.agentId || `agent_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -308,4 +344,4 @@ app.get('/metrics', (c) => {
 export default app;
 
 const port = parseInt(process.env.PORT || '3000');
-console.log('🧬 Helix Bridge v0.2.0 running on port', port);
+console.log('🧬 Helix Bridge v0.2.2 running on port', port);
