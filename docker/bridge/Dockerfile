@@ -1,23 +1,19 @@
 # Bridge Docker image — Bun + Hono monorepo
+# Lint runs in CI as a separate job; this is for production image build
 FROM oven/bun:1.3 AS base
 WORKDIR /app
 
-# Dependencies — copy all workspace package.json files
+# Workspace dependencies
 COPY package.json ./
 COPY packages/bridge/package.json packages/bridge/
 COPY packages/shared/package.json packages/shared/
 COPY packages/shared/tsconfig.json packages/shared/
-RUN bun install --frozen-lockfile || bun install
+RUN bun install --production
 
 # Source
 COPY packages/bridge/src packages/bridge/src
-COPY packages/bridge/tsconfig.json packages/bridge/
 COPY packages/shared/src packages/shared/src
 COPY tsconfig.base.json ./
-
-# Typecheck
-WORKDIR /app/packages/bridge
-RUN bun run lint
 
 FROM oven/bun:1.3-slim AS runner
 WORKDIR /app
@@ -29,10 +25,8 @@ COPY --from=base /app/tsconfig.base.json /app/
 
 ENV NODE_ENV=production
 ENV PORT=3000
-
 EXPOSE 3000
 
 USER bun
-
 WORKDIR /app/packages/bridge
 CMD ["bun", "run", "src/index.ts"]
