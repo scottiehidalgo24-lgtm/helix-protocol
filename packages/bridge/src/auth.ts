@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { writeFileSync, existsSync, readFileSync } from "node:fs";
 
 const API_KEY_HEADER = 'x-helix-api-key';
 const BEARER_PREFIX = 'Bearer ';
@@ -38,9 +39,17 @@ export function authenticate(header: string | null): AuthResult {
     return { authenticated: true, agentId: keyData.agentId, authType: 'api_key' };
   }
 
-  // OAuth2 Bearer token
+  // OAuth2 Bearer token (also accepts API keys with hk_ prefix)
   if (header.startsWith(BEARER_PREFIX)) {
     const token = header.slice(BEARER_PREFIX.length);
+    // Support apiKey passed as Bearer token (for proxy compatibility)
+    if (token.startsWith('hk_')) {
+      const keyData = apiKeys.get(token);
+      if (keyData) {
+        return { authenticated: true, agentId: keyData.agentId, authType: 'api_key' };
+      }
+      return { authenticated: false, error: 'Invalid API key' };
+    }
     const tokenData = oauthTokens.get(token);
     if (!tokenData) {
       return { authenticated: false, error: 'Invalid OAuth token' };
@@ -75,13 +84,19 @@ export function generateOAuthCredentials(): { clientId: string; clientSecret: st
   return { clientId, clientSecret };
 }
 
-// Bootstrap: genera una root key al primo avvio
-const BOOTSTRAP_KEY = "hk_" + Array.from({length: 32}, () => 
-  "abcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(Math.random() * 36)]
-).join("");
+// Bootstrap: genera una root key al primo avvio e la salva su file sicuro
+const BOOTSTRAP_KEY_FILE = "/opt/helix-protocol/bootstrap-key.txt";
+let BOOTSTRAP_KEY: string;
+
+if (existsSync(BOOTSTRAP_KEY_FILE)) {
+  BOOTSTRAP_KEY = readFileSync(BOOTSTRAP_KEY_FILE, "utf8").trim();
+} else {
+  BOOTSTRAP_KEY = "hk_" + Array.from({length: 32}, () =>
+    "abcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(Math.random() * 36)]
+  ).join("");
+  writeFileSync(BOOTSTRAP_KEY_FILE, BOOTSTRAP_KEY, { mode: 0o600 });
+}
 
 registerApiKey(BOOTSTRAP_KEY, "root", ["*"]);
 
-console.log("🔑 Helix Bridge Bootstrap API Key:", BOOTSTRAP_KEY);
-console.log("   ⚠️  SAVE THIS KEY — it will not be shown again.");
-console.log("   Use: curl -H 'x-helix-api-key: " + BOOTSTRAP_KEY + "' http://localhost:3000/...");
+console.log("🔑 Bootstrap API key loaded from secure file");
