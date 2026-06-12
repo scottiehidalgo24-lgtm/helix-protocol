@@ -5,13 +5,13 @@ WORKDIR /app
 # Dependencies
 COPY package.json bun.lockb* ./
 COPY packages/bridge/package.json packages/bridge/
-COPY packages/shared/package.json packages/shared/ 2>/dev/null || true
-RUN bun install --frozen-lockfile
+RUN if [ -f packages/shared/package.json ]; then       cp packages/shared/package.json packages/shared/;     fi
+RUN bun install --frozen-lockfile || bun install
 
 # Source
 COPY packages/bridge/src packages/bridge/src
 COPY packages/bridge/tsconfig.json packages/bridge/
-COPY packages/shared/src packages/shared/src 2>/dev/null || true
+RUN if [ -d packages/shared/src ]; then       cp -r packages/shared/src packages/shared/src;     fi
 COPY tsconfig.base.json ./
 
 # Build typecheck
