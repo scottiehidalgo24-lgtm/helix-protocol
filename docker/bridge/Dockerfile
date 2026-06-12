@@ -2,19 +2,20 @@
 FROM oven/bun:1.3 AS base
 WORKDIR /app
 
-# Dependencies
-COPY package.json bun.lockb* ./
+# Dependencies — copy all workspace package.json files
+COPY package.json ./
 COPY packages/bridge/package.json packages/bridge/
-RUN if [ -f packages/shared/package.json ]; then       cp packages/shared/package.json packages/shared/;     fi
+COPY packages/shared/package.json packages/shared/
+COPY packages/shared/tsconfig.json packages/shared/
 RUN bun install --frozen-lockfile || bun install
 
 # Source
 COPY packages/bridge/src packages/bridge/src
 COPY packages/bridge/tsconfig.json packages/bridge/
-RUN if [ -d packages/shared/src ]; then       cp -r packages/shared/src packages/shared/src;     fi
+COPY packages/shared/src packages/shared/src
 COPY tsconfig.base.json ./
 
-# Build typecheck
+# Typecheck
 WORKDIR /app/packages/bridge
 RUN bun run lint
 
