@@ -22,6 +22,7 @@ export interface AuthResult {
   authenticated: boolean;
   agentId?: string;
   authType?: 'api_key' | 'oauth2';
+  scopes?: string[];
   error?: string;
 }
 
@@ -36,7 +37,7 @@ export function authenticate(header: string | null): AuthResult {
     if (!keyData) {
       return { authenticated: false, error: 'Invalid API key' };
     }
-    return { authenticated: true, agentId: keyData.agentId, authType: 'api_key' };
+    return { authenticated: true, agentId: keyData.agentId, authType: 'api_key', scopes: keyData.scopes };
   }
 
   // OAuth2 Bearer token (also accepts API keys with hk_ prefix)
@@ -46,7 +47,7 @@ export function authenticate(header: string | null): AuthResult {
     if (token.startsWith('hk_')) {
       const keyData = apiKeys.get(token);
       if (keyData) {
-        return { authenticated: true, agentId: keyData.agentId, authType: 'api_key' };
+        return { authenticated: true, agentId: keyData.agentId, authType: 'api_key', scopes: keyData.scopes };
       }
       return { authenticated: false, error: 'Invalid API key' };
     }
@@ -58,7 +59,7 @@ export function authenticate(header: string | null): AuthResult {
       oauthTokens.delete(token);
       return { authenticated: false, error: 'OAuth token expired' };
     }
-    return { authenticated: true, agentId: tokenData.agentId, authType: 'oauth2' };
+    return { authenticated: true, agentId: tokenData.agentId, authType: 'oauth2', scopes: tokenData.scopes };
   }
 
   return { authenticated: false, error: 'Unsupported authorization method' };
